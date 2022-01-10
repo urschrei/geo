@@ -232,4 +232,23 @@ mod test {
 
         assert_eq!(&ls.points_ccw().collect::<Vec<_>>(), &ccw_ls,);
     }
+    #[test]
+    fn winding_error() {
+        // closed ccw line verified w/JTS Testrunner
+        let a = Point::new(2.6f64, 3.55);
+        let b = Point::new(2.5785f64, 3.5245);
+        let c = Point::new(2.5815f64, 3.4745);
+        let d = Point::new(2.6165f64, 3.4625);
+        let e = Point::new(2.6375f64, 3.4985);
+        let f = Point::new(2.6f64, 3.55);
+
+        let ls = LineString::from(vec![a, b, c, d, e, f]);
+        // rewind!
+        let cw_ls: Vec<_> = ls.points_cw().collect();
+        // These should have different windings
+        assert_ne!(&cw_ls, &vec![a, b, c, d, e, f]);
+        let cw_ls = LineString::from(cw_ls);
+        // verify cw
+        assert!(cw_ls.is_cw());
+    }
 }
