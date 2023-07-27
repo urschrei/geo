@@ -5,6 +5,7 @@ use crate::GeoFloat;
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use rstar::primitives::CachedEnvelope;
 use rstar::RTree;
 
 pub(crate) struct RstarEdgeSetIntersector;
@@ -58,11 +59,12 @@ where
         check_for_self_intersecting_edges: bool,
         segment_intersector: &mut SegmentIntersector<F>,
     ) {
-        let segments: Vec<Segment<F>> = edges
+        let segments: Vec<CachedEnvelope<Segment<F>>> = edges
             .iter()
             .flat_map(|edge| {
                 let start_of_final_segment: usize = RefCell::borrow(edge).coords().len() - 1;
-                (0..start_of_final_segment).map(|segment_i| Segment::new(segment_i, edge))
+                (0..start_of_final_segment)
+                    .map(|segment_i| CachedEnvelope::new(Segment::new(segment_i, edge)))
             })
             .collect();
         let tree = RTree::bulk_load(segments);
@@ -80,20 +82,22 @@ where
         edges1: &[Rc<RefCell<Edge<F>>>],
         segment_intersector: &mut SegmentIntersector<F>,
     ) {
-        let segments0: Vec<Segment<F>> = edges0
+        let segments0: Vec<CachedEnvelope<Segment<F>>> = edges0
             .iter()
             .flat_map(|edge| {
                 let start_of_final_segment: usize = RefCell::borrow(edge).coords().len() - 1;
-                (0..start_of_final_segment).map(|segment_i| Segment::new(segment_i, edge))
+                (0..start_of_final_segment)
+                    .map(|segment_i| CachedEnvelope::new(Segment::new(segment_i, edge)))
             })
             .collect();
         let tree_0 = RTree::bulk_load(segments0);
 
-        let segments1: Vec<Segment<F>> = edges1
+        let segments1: Vec<CachedEnvelope<Segment<F>>> = edges1
             .iter()
             .flat_map(|edge| {
                 let start_of_final_segment: usize = RefCell::borrow(edge).coords().len() - 1;
-                (0..start_of_final_segment).map(|segment_i| Segment::new(segment_i, edge))
+                (0..start_of_final_segment)
+                    .map(|segment_i| CachedEnvelope::new(Segment::new(segment_i, edge)))
             })
             .collect();
         let tree_1 = RTree::bulk_load(segments1);
