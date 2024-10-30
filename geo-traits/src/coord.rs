@@ -1,7 +1,5 @@
 use std::marker::PhantomData;
 
-use geo_types::{Coord, CoordNum};
-
 use crate::Dimensions;
 
 /// A trait for accessing data from a generic Coord.
@@ -9,7 +7,7 @@ use crate::Dimensions;
 /// Refer to [geo_types::Coord] for information about semantics and validity.
 pub trait CoordTrait {
     /// The coordinate type of this geometry
-    type T: CoordNum;
+    type T;
 
     /// Dimensions of the coordinate tuple
     fn dim(&self) -> Dimensions;
@@ -65,7 +63,8 @@ pub trait CoordTrait {
     }
 }
 
-impl<T: CoordNum> CoordTrait for Coord<T> {
+#[cfg(feature = "geo-types")]
+impl<T: geo_types::CoordNum> CoordTrait for geo_types::Coord<T> {
     type T = T;
 
     fn nth_or_panic(&self, n: usize) -> Self::T {
@@ -89,7 +88,8 @@ impl<T: CoordNum> CoordTrait for Coord<T> {
     }
 }
 
-impl<T: CoordNum> CoordTrait for &Coord<T> {
+#[cfg(feature = "geo-types")]
+impl<T: geo_types::CoordNum> CoordTrait for &geo_types::Coord<T> {
     type T = T;
 
     fn nth_or_panic(&self, n: usize) -> Self::T {
@@ -113,7 +113,7 @@ impl<T: CoordNum> CoordTrait for &Coord<T> {
     }
 }
 
-impl<T: CoordNum> CoordTrait for (T, T) {
+impl<T: Copy> CoordTrait for (T, T) {
     type T = T;
 
     fn nth_or_panic(&self, n: usize) -> Self::T {
@@ -141,9 +141,9 @@ impl<T: CoordNum> CoordTrait for (T, T) {
 ///
 /// This can be used as the `CoordType` of the `GeometryTrait` by implementations that don't have a
 /// Coord concept
-pub struct UnimplementedCoord<T: CoordNum>(PhantomData<T>);
+pub struct UnimplementedCoord<T>(PhantomData<T>);
 
-impl<T: CoordNum> CoordTrait for UnimplementedCoord<T> {
+impl<T> CoordTrait for UnimplementedCoord<T> {
     type T = T;
 
     fn dim(&self) -> Dimensions {
