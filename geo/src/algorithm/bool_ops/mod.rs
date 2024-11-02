@@ -228,12 +228,10 @@ impl<T: BoolOpsNum> BooleanOps for MultiPolygon<T> {
     }
 }
 
-/// Allows the unary union operation to be performed on any container which can produce items of type `Polygon<T>`
-impl<T, Container> UnaryUnion for Container
+impl<T> UnaryUnion for &[Polygon<T>]
 where
     T: BoolOpsNum,
-    Container: IntoIterator<Item = Polygon<T>> + Clone,
-    Polygon<T>: RTreeObject,
+    Polygon<T>: RTreeObject + Clone,
 {
     type Scalar = T;
 
@@ -248,7 +246,35 @@ where
         let reduce = |accum1: MultiPolygon<T>, accum2: MultiPolygon<T>| -> MultiPolygon<T> {
             accum1.union(&accum2)
         };
-        let rtree = RTree::bulk_load(self.clone().into_iter().map(CachedEnvelope::new).collect());
+        let rtree = RTree::bulk_load(
+            self.into_iter()
+                .map(|p| CachedEnvelope::new(p.clone()))
+                .collect(),
+        );
         bottom_up_fold_reduce(&rtree, init, fold, reduce)
+    }
+}
+
+impl<T> UnaryUnion for Vec<Polygon<T>>
+where
+    T: BoolOpsNum,
+    Polygon<T>: RTreeObject + Clone,
+{
+    type Scalar = T;
+
+    fn unary_union(&self) -> MultiPolygon<Self::Scalar> {
+        self.as_slice().unary_union()
+    }
+}
+
+impl<T> UnaryUnion for MultiPolygon<T>
+where
+    T: BoolOpsNum,
+    Polygon<T>: RTreeObject + Clone,
+{
+    type Scalar = T;
+
+    fn unary_union(&self) -> MultiPolygon<Self::Scalar> {
+        self.0.unary_union()
     }
 }
