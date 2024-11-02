@@ -5,7 +5,7 @@ mod tests;
 pub use i_overlay_integration::BoolOpsNum;
 
 use crate::geometry::{LineString, MultiLineString, MultiPolygon, Polygon};
-use rstar::{ParentNode, RTree, RTreeNode, RTreeObject};
+use rstar::{primitives::CachedEnvelope, ParentNode, RTree, RTreeNode, RTreeObject};
 
 /// Boolean Operations on geometry.
 ///
@@ -240,14 +240,15 @@ where
     fn unary_union(&self) -> MultiPolygon<Self::Scalar> {
         // these three functions drive the union operation
         let init = || MultiPolygon::<T>::new(vec![]);
-        let fold = |mut accum: MultiPolygon<T>, poly: &Polygon<T>| -> MultiPolygon<T> {
-            accum = accum.union(poly);
-            accum
-        };
+        let fold =
+            |mut accum: MultiPolygon<T>, poly: &CachedEnvelope<Polygon<T>>| -> MultiPolygon<T> {
+                accum = accum.union(std::ops::Deref::deref(poly));
+                accum
+            };
         let reduce = |accum1: MultiPolygon<T>, accum2: MultiPolygon<T>| -> MultiPolygon<T> {
             accum1.union(&accum2)
         };
-        let rtree = RTree::bulk_load(self.clone().into_iter().collect());
+        let rtree = RTree::bulk_load(self.clone().into_iter().map(CachedEnvelope::new).collect());
         bottom_up_fold_reduce(&rtree, init, fold, reduce)
     }
 }
