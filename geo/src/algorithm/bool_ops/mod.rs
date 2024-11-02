@@ -175,19 +175,22 @@ pub trait UnaryUnion {
 // Though the operation is carried out via fold() over the tree iterator, there are two actual nested operations:
 // "fold" operations on leaf nodes build up output MultiPolygons by adding Polygons to them via union and
 // "reduce" operations on parent nodes combine these output MultiPolygons from leaf operations by recursion
-fn bottom_up_fold_reduce<T, S, I, F, R>(
-    tree: &RTree<T>,
-    mut init: I,
-    mut fold: F,
-    mut reduce: R,
-) -> S
+fn bottom_up_fold_reduce<T, S, I, F, R>(tree: &RTree<T>, init: I, fold: F, reduce: R) -> S
 where
     T: RTreeObject,
     I: FnMut() -> S,
     F: FnMut(S, &T) -> S,
     R: FnMut(S, S) -> S,
 {
-    fn inner<T, S, I, F, R>(parent: &ParentNode<T>, init: &mut I, fold: &mut F, reduce: &mut R) -> S
+    // recursive algorithms can benefit from grouping those parameters which are constant over
+    // the whole algorithm to reduce the overhead of the recursive calls
+    struct Ops<I, F, R> {
+        init: I,
+        fold: F,
+        reduce: R,
+    }
+
+    fn inner<T, S, I, F, R>(ops: &mut Ops<I, F, R>, parent: &ParentNode<T>) -> S
     where
         T: RTreeObject,
         I: FnMut() -> S,
@@ -197,16 +200,16 @@ where
         parent
             .children()
             .iter()
-            .fold(init(), |accum, child| match child {
-                RTreeNode::Leaf(value) => fold(accum, value),
+            .fold((ops.init)(), |accum, child| match child {
+                RTreeNode::Leaf(value) => (ops.fold)(accum, value),
                 RTreeNode::Parent(parent) => {
-                    let value = inner(parent, init, fold, reduce);
-                    reduce(accum, value)
+                    let value = inner(ops, parent);
+                    (ops.reduce)(accum, value)
                 }
             })
     }
-
-    inner(tree.root(), &mut init, &mut fold, &mut reduce)
+    let mut ops = Ops { init, fold, reduce };
+    inner(&mut ops, tree.root())
 }
 
 impl<T: BoolOpsNum> BooleanOps for Polygon<T> {
