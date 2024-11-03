@@ -3,13 +3,20 @@ use crate::{wkt, Convert, MultiPolygon, Polygon, Relate};
 
 #[test]
 fn test_unary_union() {
-    let poly1: Polygon = wkt!(POLYGON((204.0 287.0,206.69670020700084 288.2213844497616,200.38308697914755 288.338793163584,204.0 287.0)));
+    let poly1: Polygon = wkt!(POLYGON((204.0 287.0,203.69670020700084 288.2213844497616,200.38308697914755 288.338793163584,204.0 287.0)));
     let poly2: Polygon = wkt!(POLYGON((210.0 290.0,204.07584923592933 288.2701221108328,212.24082541367974 285.47846008552216,210.0 290.0)));
-    let poly3: Polygon = wkt!(POLYGON((211.0 292.0,204.07584923592933 288.2701221108328,212.24082541367974 285.47846008552216,210.0 290.0)));
+    let poly3: Polygon = wkt!(POLYGON((211.0 292.0,202.07584923592933 288.2701221108328,212.24082541367974 285.47846008552216,210.0 290.0)));
 
-    let polys = vec![poly1, poly2, poly3];
-    let res = polys.unary_union();
-    assert_eq!(res.0.len(), 1);
+    let polys = vec![poly1.clone(), poly2.clone(), poly3.clone()];
+    let poly_union = polys.unary_union();
+    assert_eq!(poly_union.0.len(), 1);
+
+    let multi_poly_12 = MultiPolygon::new(vec![poly1.clone(), poly2.clone()]);
+    let multi_poly_3 = MultiPolygon::new(vec![poly3]);
+    let multi_polys = vec![multi_poly_12.clone(), multi_poly_3.clone()];
+    let multi_poly_union = multi_polys.unary_union();
+    assert_eq!(multi_poly_union.0.len(), 1);
+}
 }
 
 #[test]
