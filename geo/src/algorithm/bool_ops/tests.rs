@@ -17,7 +17,6 @@ fn test_unary_union() {
     let multi_poly_union = multi_polys.unary_union();
     assert_eq!(multi_poly_union.0.len(), 1);
 }
-}
 
 #[test]
 fn jts_test_overlay_la_1() {
