@@ -228,10 +228,11 @@ impl<T: BoolOpsNum> BooleanOps for MultiPolygon<T> {
     }
 }
 
-impl<T> UnaryUnion for &[Polygon<T>]
+impl<T, Boppable, BoppableCollection> UnaryUnion for BoppableCollection
 where
     T: BoolOpsNum,
-    Polygon<T>: RTreeObject + Clone,
+    Boppable: BooleanOps<Scalar = T> + RTreeObject,
+    BoppableCollection: IntoIterator<Item = Boppable> + Clone,
 {
     type Scalar = T;
 
@@ -239,7 +240,7 @@ where
         // these three functions drive the union operation
         let init = || MultiPolygon::<T>::new(vec![]);
         let fold =
-            |mut accum: MultiPolygon<T>, poly: &CachedEnvelope<Polygon<T>>| -> MultiPolygon<T> {
+            |mut accum: MultiPolygon<T>, poly: &CachedEnvelope<Boppable>| -> MultiPolygon<T> {
                 accum = accum.union(std::ops::Deref::deref(poly));
                 accum
             };
@@ -247,34 +248,11 @@ where
             accum1.union(&accum2)
         };
         let rtree = RTree::bulk_load(
-            self.into_iter()
-                .map(|p| CachedEnvelope::new(p.clone()))
+            self.clone()
+                .into_iter()
+                .map(|p| CachedEnvelope::new(p))
                 .collect(),
         );
         bottom_up_fold_reduce(&rtree, init, fold, reduce)
-    }
-}
-
-impl<T> UnaryUnion for Vec<Polygon<T>>
-where
-    T: BoolOpsNum,
-    Polygon<T>: RTreeObject + Clone,
-{
-    type Scalar = T;
-
-    fn unary_union(&self) -> MultiPolygon<Self::Scalar> {
-        self.as_slice().unary_union()
-    }
-}
-
-impl<T> UnaryUnion for MultiPolygon<T>
-where
-    T: BoolOpsNum,
-    Polygon<T>: RTreeObject + Clone,
-{
-    type Scalar = T;
-
-    fn unary_union(&self) -> MultiPolygon<Self::Scalar> {
-        self.0.unary_union()
     }
 }
