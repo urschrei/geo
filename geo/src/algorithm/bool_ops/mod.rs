@@ -168,7 +168,7 @@ pub trait UnaryUnion {
     /// let combined = mp.unary_union();
     /// assert_eq!(&combined, merged);
     /// ```
-    fn unary_union(&self) -> MultiPolygon<Self::Scalar>;
+    fn unary_union(self) -> MultiPolygon<Self::Scalar>;
 }
 
 // This function carries out a full post-order traversal of the tree, building up MultiPolygons from inside to outside.
@@ -228,29 +228,44 @@ impl<T: BoolOpsNum> BooleanOps for MultiPolygon<T> {
     }
 }
 
-impl<T, Boppable, BoppableCollection> UnaryUnion for BoppableCollection
+// This struct and its RTReeObject impl allow construction of an R tree containing short-lived
+// references to the original objects.
+struct RTreeObjectRef<'a, T>(&'a T);
+
+impl<'a, T> RTreeObject for RTreeObjectRef<'a, T>
+where
+    T: RTreeObject,
+{
+    type Envelope = T::Envelope;
+
+    fn envelope(&self) -> Self::Envelope {
+        self.0.envelope()
+    }
+}
+
+impl<'a, T, Boppable, BoppableCollection> UnaryUnion for &'a BoppableCollection
 where
     T: BoolOpsNum,
-    Boppable: BooleanOps<Scalar = T> + RTreeObject,
-    BoppableCollection: IntoIterator<Item = Boppable> + Clone,
+    Boppable: BooleanOps<Scalar = T> + RTreeObject + 'a,
+    Self: IntoIterator<Item = &'a Boppable>,
 {
     type Scalar = T;
 
-    fn unary_union(&self) -> MultiPolygon<Self::Scalar> {
+    fn unary_union(self) -> MultiPolygon<Self::Scalar> {
         // these three functions drive the union operation
         let init = || MultiPolygon::<T>::new(vec![]);
-        let fold =
-            |mut accum: MultiPolygon<T>, poly: &CachedEnvelope<Boppable>| -> MultiPolygon<T> {
-                accum = accum.union(std::ops::Deref::deref(poly));
-                accum
-            };
+        let fold = |mut accum: MultiPolygon<T>,
+                    poly: &CachedEnvelope<RTreeObjectRef<'a, Boppable>>|
+         -> MultiPolygon<T> {
+            accum = accum.union((&*poly).0);
+            accum
+        };
         let reduce = |accum1: MultiPolygon<T>, accum2: MultiPolygon<T>| -> MultiPolygon<T> {
             accum1.union(&accum2)
         };
         let rtree = RTree::bulk_load(
-            self.clone()
-                .into_iter()
-                .map(|p| CachedEnvelope::new(p))
+            self.into_iter()
+                .map(|p| CachedEnvelope::new(RTreeObjectRef(p)))
                 .collect(),
         );
         bottom_up_fold_reduce(&rtree, init, fold, reduce)
