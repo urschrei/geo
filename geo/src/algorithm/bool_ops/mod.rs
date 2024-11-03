@@ -257,7 +257,7 @@ where
         let fold = |mut accum: MultiPolygon<T>,
                     poly: &CachedEnvelope<RTreeObjectRef<'a, Boppable>>|
          -> MultiPolygon<T> {
-            accum = accum.union((&*poly).0);
+            accum = accum.union(poly.0);
             accum
         };
         let reduce = |accum1: MultiPolygon<T>, accum2: MultiPolygon<T>| -> MultiPolygon<T> {
