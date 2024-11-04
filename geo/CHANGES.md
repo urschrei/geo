@@ -8,6 +8,8 @@
   - <https://github.com/georust/geo/pull/1250>
 - Improve handling of InterploatePoint with collapsed Line
   - <https://github.com/georust/geo/pull/1248>
+- Add Unary Union algorithm for fast union ops on adjacent / overlapping geometries
+  - <https://github.com/georust/geo/pull/1246>
 
 ## 0.29.0 - 2024.10.30
 
