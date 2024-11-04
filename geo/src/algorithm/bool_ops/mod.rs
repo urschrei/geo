@@ -178,9 +178,10 @@ pub trait UnaryUnion {
 fn bottom_up_fold_reduce<T, S, I, F, R>(tree: &RTree<T>, init: I, fold: F, reduce: R) -> S
 where
     T: RTreeObject,
-    I: FnMut() -> S,
-    F: FnMut(S, &T) -> S,
-    R: FnMut(S, S) -> S,
+    RTreeNode<T>: Send + Sync,
+    I: FnMut() -> S + Send + Sync,
+    F: FnMut(S, &T) -> S + Send + Sync,
+    R: FnMut(S, S) -> S + Send + Sync,
 {
     // recursive algorithms can benefit from grouping those parameters which are constant over
     // the whole algorithm to reduce the overhead of the recursive calls
@@ -246,7 +247,8 @@ where
 impl<'a, T, Boppable, BoppableCollection> UnaryUnion for &'a BoppableCollection
 where
     T: BoolOpsNum,
-    Boppable: BooleanOps<Scalar = T> + RTreeObject + 'a,
+    Boppable: BooleanOps<Scalar = T> + RTreeObject + 'a + Sync,
+    <Boppable as RTreeObject>::Envelope: Send + Sync,
     Self: IntoIterator<Item = &'a Boppable>,
 {
     type Scalar = T;
