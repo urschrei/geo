@@ -5,6 +5,8 @@ use alloc::vec::Vec;
 #[cfg(any(feature = "approx", test))]
 use approx::{AbsDiffEq, RelativeEq};
 use core::iter::FromIterator;
+#[cfg(feature = "multithreading")]
+use rayon::prelude::*;
 
 /// A collection of
 /// [`LineString`s](line_string/struct.LineString.html). Can
@@ -29,7 +31,7 @@ use core::iter::FromIterator;
 ///
 /// A `MultiLineString` is _simple_ if and only if all of
 /// its elements are simple and the only intersections
-/// between any two elements occur at `Point`s that are on
+/// between any two elements occur at `Points`s that are on
 /// the boundaries of both elements. A `MultiLineString` is
 /// _closed_ if all of its elements are closed. The boundary
 /// of a closed `MultiLineString` is always empty.
@@ -115,6 +117,36 @@ impl<T: CoordNum> MultiLineString<T> {
 
     pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut LineString<T>> {
         self.0.iter_mut()
+    }
+}
+
+#[cfg(feature = "multithreading")]
+impl<T: CoordNum + Send> IntoParallelIterator for MultiLineString<T> {
+    type Item = LineString<T>;
+    type Iter = rayon::vec::IntoIter<LineString<T>>;
+
+    fn into_par_iter(self) -> Self::Iter {
+        self.0.into_par_iter()
+    }
+}
+
+#[cfg(feature = "multithreading")]
+impl<'a, T: CoordNum + Sync> IntoParallelIterator for &'a MultiLineString<T> {
+    type Item = &'a LineString<T>;
+    type Iter = rayon::slice::Iter<'a, LineString<T>>;
+
+    fn into_par_iter(self) -> Self::Iter {
+        self.0.par_iter()
+    }
+}
+
+#[cfg(feature = "multithreading")]
+impl<'a, T: CoordNum + Send + Sync> IntoParallelIterator for &'a mut MultiLineString<T> {
+    type Item = &'a mut LineString<T>;
+    type Iter = rayon::slice::IterMut<'a, LineString<T>>;
+
+    fn into_par_iter(self) -> Self::Iter {
+        self.0.par_iter_mut()
     }
 }
 
