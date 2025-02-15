@@ -1,7 +1,9 @@
+use std::cmp::Ordering;
+
 use super::{Distance, Euclidean};
 use crate::algorithm::Intersects;
 use crate::coordinate_position::{coord_pos_relative_to_ring, CoordPos};
-use crate::geometry::*;
+use crate::{geometry::*, Centroid};
 use crate::{CoordFloat, GeoFloat, GeoNum};
 use num_traits::{Bounded, Float};
 use rstar::primitives::CachedEnvelope;
@@ -235,7 +237,7 @@ impl<F: GeoFloat> Distance<F, &Polygon<F>, &Polygon<F>> for Euclidean {
             }
             return mindist;
         }
-        nearest_neighbour_distance(polygon_a.exterior(), polygon_b.exterior())
+        min_distance_project(&polygon_a, &polygon_b)
     }
 }
 
@@ -359,6 +361,164 @@ impl<F: GeoFloat> Distance<F, &Geometry<F>, &Geometry<F>> for Euclidean {
 // │ Implementations utilities │
 // └───────────────────────────┘
 
+/// Represents an edge from one of the polygons, along with its
+/// projection extent onto the inter-centroid line.
+#[derive(Debug)]
+struct ProjectedEdge<F: GeoFloat> {
+    /// The actual edge line
+    edge: Line<F>,
+    /// Which polygon this edge comes from (true = first)
+    from_first: bool,
+    /// Min projection value along the centroid-to-centroid line
+    min_proj: F,
+    /// Max projection value along the centroid-to-centroid line
+    max_proj: F,
+}
+
+// An implementation of the project-and-prune algorithm implemented in PostGIS, and described in:
+// <https://www.crunchydata.com/blog/inside-postgis-calculating-distance>.
+//
+// Note that this polygon is only suitable for non-overlapping Polygons
+fn min_distance_project<F>(poly1: &Polygon<F>, poly2: &Polygon<F>) -> F
+where
+    F: GeoFloat,
+{
+    // Early exit if polygons intersect
+    if poly1.intersects(poly2) {
+        return F::zero();
+    }
+
+    // Get centroids to create projection line
+    let centroid1 = poly1
+        .centroid()
+        .expect("Invalid polygon A: couldn't get centroid");
+    let centroid2 = poly2
+        .centroid()
+        .expect("Invalid polygon B: couldn't get centroid");
+
+    // Create projection line between centroids
+    let proj_line = Line::new(centroid1, centroid2);
+
+    // Project all edges from both polygons
+    let mut projected_edges = Vec::new();
+
+    // Project first polygon edges
+    project_polygon_edges(poly1, true, proj_line, &mut projected_edges);
+
+    // Project second polygon edges
+    project_polygon_edges(poly2, false, proj_line, &mut projected_edges);
+
+    // Sort edges by their minimum projection value
+    projected_edges.sort_by(|a, b| {
+        a.min_proj
+            .partial_cmp(&b.min_proj)
+            .unwrap_or(Ordering::Equal)
+    });
+
+    // Now find minimum distance using the sorted projections
+    find_minimum_distance(&projected_edges)
+}
+
+/// Projects all edges of a polygon onto a reference line, storing their projections
+/// as intervals. This is a key part of the optimization strategy - by projecting
+/// edges onto a common line (typically between polygon centroids), we can efficiently
+/// identify which edges might be closest to each other.
+///
+/// The projection of an edge results in an interval on the reference line.
+/// These intervals help us quickly eliminate edge pairs that cannot possibly
+/// be the closest pair between the polygons.
+fn project_polygon_edges<F>(
+    polygon: &Polygon<F>,
+    from_first: bool,
+    proj_line: Line<F>,
+    projected_edges: &mut Vec<ProjectedEdge<F>>,
+) where
+    F: GeoFloat,
+{
+    let points: Vec<_> = polygon.exterior().points().collect();
+
+    // Note: len() - 1 because the last point is the same as the first in a ring
+    // Process each edge of the polygon
+    for i in 0..points.len() - 1 {
+        let edge = Line::new(points[i], points[i + 1]);
+
+        // Project both endpoints onto the projection line
+        let proj1 = project_point_onto_line(points[i], proj_line);
+        let proj2 = project_point_onto_line(points[i + 1], proj_line);
+
+        // Store the projections as an interval
+        projected_edges.push(ProjectedEdge {
+            edge,
+            from_first,
+            min_proj: proj1.min(proj2),
+            max_proj: proj1.max(proj2),
+        });
+    }
+}
+
+/// Projects a [`Point`] onto a [`Line`] and returns the scalar projection value.
+///
+/// This function computes where a Point would "fall" if dropped perpendicularly
+/// onto the reference line. The return value is a scalar that represents how
+/// far along the reference line this projection lies, where:
+/// - 0.0 represents the start of the line
+/// - 1.0 represents the end of the line
+/// - Values outside [0,1] indicate projections that fall beyond the line endpoints
+///
+/// The calculation uses vector algebra:
+/// 1. Convert the line and point into vectors from a common origin
+/// 2. Use the dot product to compute the scalar projection
+/// 3. Normalize by the line's length squared
+fn project_point_onto_line<F>(point: Point<F>, line: Line<F>) -> F
+where
+    F: GeoFloat,
+{
+    let ab = Point::new(line.end.x - line.start.x, line.end.y - line.start.y);
+    let ap = Point::new(point.x() - line.start.x, point.y() - line.start.y);
+
+    // Calculate projection using dot product
+    let ab_length_squared = ab.dot(ab);
+    if ab_length_squared == F::zero() {
+        return F::zero();
+    }
+
+    ap.dot(ab) / ab_length_squared
+}
+
+fn find_minimum_distance<F>(edges: &[ProjectedEdge<F>]) -> F
+where
+    F: GeoFloat,
+{
+    let mut min_distance = <F as num_traits::Float>::max_value();
+
+    // For each edge from the first polygon...
+    for (i, edge1) in edges.iter().enumerate() {
+        if !edge1.from_first {
+            continue;
+        }
+
+        // Look at edges from the second polygon whose projections could be closest
+        for edge2 in edges.iter().skip(i) {
+            if edge2.from_first {
+                continue;
+            }
+
+            // If the projection intervals are too far apart, this pair can't be closest
+            if edge2.min_proj > edge1.max_proj + min_distance
+                || edge1.min_proj > edge2.max_proj + min_distance
+            {
+                continue;
+            }
+
+            // Calculate actual distance between these edges
+            let dist = Euclidean.distance(&edge1.edge, &edge2.edge);
+            min_distance = min_distance.min(dist);
+        }
+    }
+
+    min_distance
+}
+
 /// Uses an R* tree and nearest-neighbour lookups to calculate minimum distances
 // This is somewhat slow and memory-inefficient, but certainly better than quadratic time
 fn nearest_neighbour_distance<F: GeoFloat>(geom1: &LineString<F>, geom2: &LineString<F>) -> F {
@@ -390,6 +550,29 @@ mod test {
     use crate::orient::{Direction, Orient};
     use crate::{Line, LineString, MultiLineString, MultiPoint, MultiPolygon, Point, Polygon};
     use geo_types::{coord, polygon, private_utils::line_segment_distance};
+
+    #[test]
+    fn test_disjoint_polygons() {
+        let poly1 = polygon![
+            (x: 0.0, y: 0.0),
+            (x: 1.0, y: 0.0),
+            (x: 1.0, y: 1.0),
+            (x: 0.0, y: 1.0),
+            (x: 0.0, y: 0.0),
+        ];
+
+        let poly2 = polygon![
+            (x: 3.0, y: 0.0),
+            (x: 4.0, y: 0.0),
+            (x: 4.0, y: 1.0),
+            (x: 3.0, y: 1.0),
+            (x: 3.0, y: 0.0),
+        ];
+
+        let distance = min_distance_project(&poly1, &poly2);
+        let pdist = Euclidean.distance(&poly1, &poly2);
+        assert_eq!(&distance, &pdist);
+    }
 
     #[test]
     fn line_segment_distance_test() {
@@ -767,7 +950,7 @@ mod test {
             .map(|e| Point::new(e.0, e.1))
             .collect::<Vec<_>>();
         let poly2 = Polygon::new(LineString::from(points2), vec![]);
-        let dist = nearest_neighbour_distance(poly1.exterior(), poly2.exterior());
+        let dist = min_distance_project(&poly1, &poly2);
         assert_relative_eq!(dist, 21.0);
     }
     #[test]
@@ -798,7 +981,7 @@ mod test {
             .map(|e| Point::new(e.0, e.1))
             .collect::<Vec<_>>();
         let poly2 = Polygon::new(LineString::from(points2), vec![]);
-        let dist = nearest_neighbour_distance(poly1.exterior(), poly2.exterior());
+        let dist = min_distance_project(&poly1, &poly2);
         assert_relative_eq!(dist, 29.274562336608895);
     }
     #[test]
@@ -829,7 +1012,7 @@ mod test {
             .map(|e| Point::new(e.0, e.1))
             .collect::<Vec<_>>();
         let poly2 = Polygon::new(LineString::from(points2), vec![]);
-        let dist = nearest_neighbour_distance(poly1.exterior(), poly2.exterior());
+        let dist = min_distance_project(&poly1, &poly2);
         assert_relative_eq!(dist, 12.0);
     }
     #[test]
@@ -844,6 +1027,22 @@ mod test {
         ];
         let poly2 = Polygon::new(vec2.into(), vec![]);
         let distance = Euclidean.distance(&poly1, &poly2);
+        // GEOS says 2.2864896295566055
+        assert_relative_eq!(distance, 2.2864896295566055);
+    }
+    // should be identical to GEOS output
+    #[test]
+    fn test_large_polygon_distance_projected() {
+        let ls = geo_test_fixtures::norway_main::<f64>();
+        let poly1 = Polygon::new(ls, vec![]);
+        let vec2 = vec![
+            (4.921875, 66.33750501996518),
+            (3.69140625, 65.21989393613207),
+            (6.15234375, 65.07213008560697),
+            (4.921875, 66.33750501996518),
+        ];
+        let poly2 = Polygon::new(vec2.into(), vec![]);
+        let distance = min_distance_project(&poly1, &poly2);
         // GEOS says 2.2864896295566055
         assert_relative_eq!(distance, 2.2864896295566055);
     }
