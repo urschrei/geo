@@ -1,5 +1,8 @@
 use super::{Distance, Euclidean};
+use crate::HasDimensions;
+use crate::algorithm::BoundingRect;
 use crate::algorithm::Intersects;
+use crate::algorithm::extremes::Extremes;
 use crate::coordinate_position::{CoordPos, coord_pos_relative_to_ring};
 use crate::geometry::*;
 use crate::{CoordFloat, GeoFloat, GeoNum};
@@ -214,6 +217,24 @@ impl<F: GeoFloat> Distance<F, &Polygon<F>, &Polygon<F>> for Euclidean {
         if polygon_a.intersects(polygon_b) {
             return F::zero();
         }
+        if polygon_a.is_empty() || polygon_b.is_empty() {
+            return F::zero();
+        }
+
+        // Check if bounding boxes overlap: if not, use minimum_separable_distance
+        // This is safe because if bounding boxes don't overlap, the polygons are completely
+        // separated in 2D space, so x-axis projection will give the correct minimum distance
+        let bbox_a = polygon_a.bounding_rect();
+        let bbox_b = polygon_b.bounding_rect();
+
+        if let (Some(rect_a), Some(rect_b)) = (bbox_a, bbox_b) {
+            // This is the only case where x-axis projection gives correct minimum distance
+            let x_separated = rect_a.max().x < rect_b.min().x || rect_b.max().x < rect_a.min().x;
+            if x_separated {
+                return minimum_separable_distance(polygon_a, polygon_b);
+            }
+        }
+
         // FIXME: explodes when polygon_b.exterior() is empty
         // Containment check
         if !polygon_a.interiors().is_empty()
@@ -384,6 +405,92 @@ fn ring_contains_coord<T: GeoNum>(ring: &LineString<T>, c: Coord<T>) -> bool {
     }
 }
 
+/// Calculates the minimum separable distance between two non-overlapping polygons along the x-axis.
+///
+/// This function:
+/// 1. Projects both polygons onto the x-axis
+/// 2. Sorts the projected points by x-coordinate
+/// 3. Determines which polygon is "left" and which is "right" based on their midpoints
+/// 4. Returns the distance between the rightmost point of the left polygon and the leftmost point of the right polygon
+///
+/// # Arguments
+/// * `poly1` - First polygon (assumed non-overlapping with poly2)
+/// * `poly2` - Second polygon (assumed non-overlapping with poly1)
+///
+/// # Returns
+/// The minimum separable distance between the two polygons along the x-axis
+pub(crate) fn minimum_separable_distance<F: GeoFloat>(poly1: &Polygon<F>, poly2: &Polygon<F>) -> F {
+    let extremes1 = poly1
+        .extremes()
+        .expect("Non-empty polygon should have extremes");
+    let extremes2 = poly2
+        .extremes()
+        .expect("Non-empty polygon should have extremes");
+
+    // Calculate midpoints to determine left/right
+    let midpoint1 = (extremes1.x_min.coord.x + extremes1.x_max.coord.x) / (F::one() + F::one());
+    let midpoint2 = (extremes2.x_min.coord.x + extremes2.x_max.coord.x) / (F::one() + F::one());
+
+    // Determine which polygon is left and which is right, and get candidate indices
+    let (left_poly, right_poly, left_rightmost_idx, right_leftmost_idx) = if midpoint1 < midpoint2 {
+        // poly1 is left, poly2 is right
+        (poly1, poly2, extremes1.x_max.index, extremes2.x_min.index)
+    } else {
+        // poly2 is left, poly1 is right
+        (poly2, poly1, extremes2.x_max.index, extremes1.x_min.index)
+    };
+
+    // Create 3-vertex LineStrings around each candidate point
+    let left_linestring = create_context_linestring(left_poly, left_rightmost_idx);
+    let right_linestring = create_context_linestring(right_poly, right_leftmost_idx);
+
+    // Calculate the distance between these LineStrings
+    Euclidean.distance(&left_linestring, &right_linestring)
+}
+
+/// Creates a 3-vertex LineString from a Polygon index, with the given index as the middle vertex
+fn create_context_linestring<F: GeoFloat>(poly: &Polygon<F>, center_idx: usize) -> LineString<F> {
+    // Only consider the exterior ring since interior rings cannot be closest to external polygons
+    let exterior_coords = &poly.exterior().0;
+    let num_coords = exterior_coords.len();
+
+    if num_coords < 3 || center_idx >= num_coords {
+        // Fallback: return a degenerate LineString with just the first point if available
+        if let Some(&coord) = exterior_coords.first() {
+            return LineString::new(vec![coord]);
+        } else {
+            return LineString::new(vec![]);
+        }
+    }
+
+    // For closed polygons, the last coordinate duplicates the first
+    // We have n-1 unique vertices (indices 0 to n-2) plus closing duplicate at n-1
+    let effective_coords =
+        if num_coords > 1 && exterior_coords[0] == exterior_coords[num_coords - 1] {
+            num_coords - 1 // Exclude the duplicate closing vertex
+        } else {
+            num_coords
+        };
+
+    // Calculate previous and next indices with wraparound for closed polygon
+    let prev_idx = if center_idx == 0 {
+        effective_coords.saturating_sub(1)
+    } else {
+        center_idx - 1
+    };
+    let next_idx = if center_idx >= effective_coords - 1 {
+        0 // Wrap to start for closed polygon
+    } else {
+        center_idx + 1
+    };
+
+    // Create a 3-vertex LineString using direct indexing
+    LineString::new(vec![
+        exterior_coords[prev_idx],
+        exterior_coords[center_idx],
+        exterior_coords[next_idx],
+    ])
+}
 #[cfg(test)]
 mod test {
     use super::*;
