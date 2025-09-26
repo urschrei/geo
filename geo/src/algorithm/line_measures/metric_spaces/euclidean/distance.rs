@@ -1,16 +1,15 @@
 use super::{Distance, Euclidean};
+use crate::Centroid;
 use crate::HasDimensions;
 use crate::algorithm::BoundingRect;
 use crate::algorithm::Intersects;
-use crate::algorithm::centroid::Centroid;
-use crate::algorithm::coords_iter::CoordsIter;
-use crate::algorithm::vector_ops::Vector2DOps;
 use crate::coordinate_position::{CoordPos, coord_pos_relative_to_ring};
 use crate::geometry::*;
 use crate::{CoordFloat, GeoFloat, GeoNum};
 use num_traits::{Bounded, Float};
 use rstar::RTree;
 use rstar::primitives::CachedEnvelope;
+use std::ops::ControlFlow;
 
 // Distance is a symmetric operation, so we can implement it once for both
 macro_rules! symmetric_distance_impl {
@@ -234,7 +233,7 @@ impl<F: GeoFloat> Distance<F, &Polygon<F>, &Polygon<F>> for Euclidean {
             let y_separated = rect_a.max().y < rect_b.min().y || rect_b.max().y < rect_a.min().y;
 
             if x_separated || y_separated {
-                return minimum_separable_distance(polygon_a, polygon_b);
+                return distance_polygon_polygon_fast(polygon_a, polygon_b);
             }
         }
 
@@ -408,221 +407,326 @@ fn ring_contains_coord<T: GeoNum>(ring: &LineString<T>, c: Coord<T>) -> bool {
     }
 }
 
-/// Projects polygon vertices onto an arbitrary axis using scalar projection.
+/// A polygon vertex with its projection value onto the optimization axis.
 ///
-/// This function implements the projection step of PostGIS's "project and sort" algorithm
-/// for efficient polygon distance calculation. It uses the scalar projection formula to
-/// map 2D vertex coordinates to 1D distances along the specified axis.
-///
-/// ## Mathematical Basis
-///
-/// For each vertex `v`, computes the parametric projection onto the line segment
-/// defined by `axis_start` → `axis_end`. Given a line segment from point A to B
-/// and a point P to project, the parametric coordinate r is:
-///
-/// ```text
-/// r = (P - A) · (B - A) / ||B - A||²
-/// ```
-///
-/// where:
-/// - `·` denotes the dot product
-/// - `||B - A||²` is the squared Euclidean distance
-/// - `r = 0` corresponds to point A (axis_start)
-/// - `r = 1` corresponds to point B (axis_end)
-/// - `r < 0` indicates positions before A
-/// - `r > 1` indicates positions beyond B
-///
-/// ## PostGIS Implementation
-///
-/// This formula is used in PostGIS's distance calculation function:
-/// [`lw_dist2d_pt_seg()`](https://github.com/postgis/postgis/blob/bd63102e05c5df317cb631efe782cc79e3e053db/liblwgeom/measures.c#L2305)
-/// to find the closest point on a line segment to a given point.
-///
-/// The parametric approach differs from orthogonal projection `(a · b) / ||b||`
-/// by dividing by ||b||² instead of ||b||, yielding normalized coordinates
-/// along the line segment rather than absolute distances.
-///
-/// ### Why Parametric Projection
-///
-/// The parametric value directly indicates where along the axis the projection falls,
-/// making it easy to sort points by their position along the axis. This enables
-/// PostGIS's "project and sort" optimization: vertices are projected onto an axis
-/// perpendicular to the line between polygon centers, then sorted to efficiently
-/// identify which segments are worth comparing for distance calculations.
-///
-/// ## Algorithm Origin
-///
-/// Based on PostGIS's distance optimization described in:
-/// ["Inside PostGIS: Calculating Distance"](https://www.crunchydata.com/blog/inside-postgis-calculating-distance)
-///
-/// ## Implementation Notes
-///
-/// - Only projects exterior ring vertices (interior rings cannot be closest to external polygons)
-/// - Uses squared axis length to avoid expensive square root calculation
-/// - Returns (parametric_coordinate, original_vertex_index) for spatial indexing
-fn project_vertices_onto_axis<F: GeoFloat>(
-    poly: &Polygon<F>,
-    axis_start: Point<F>,
-    axis_end: Point<F>,
-) -> Vec<(F, usize)> {
-    let c1 = axis_start.0;
-    let c2 = axis_end.0;
+/// This structure maintains the mapping between a vertex's position in the
+/// original polygon and its 1D projection value used for spatial sorting and
+/// early termination.
+#[derive(Clone, Copy, Debug)]
+struct ProjectedVertex<F: GeoFloat> {
+    /// The 1D projection value of this vertex.
+    /// Used for sorting vertices and calculating early termination thresholds.
+    intercept: F,
+    vertex_idx: usize,
+}
 
-    // Axis vector from start to end
-    let axis_vector = Coord {
-        x: c2.x - c1.x,
-        y: c2.y - c1.y,
+/// Optimized polygon-to-polygon minimum distance calculation for linearly-separable polygons
+///
+/// # Algorithm Overview
+///
+/// **Let the polygons be named `P` and `Q`**
+///
+/// 1. **Slope Calculation and Projection Axis Selection**: Calculate the vector between polygon bbox
+///    centroids and determine the slope of lines perpendicular to this connector. This slope is constant.
+///
+/// 2. **Vertex Projection**: Project all vertices from `P` and `Q` into 1D space by calculating where a line
+///    through each vertex (with the perpendicular slope) intercepts either the `x` axis or `y` axis
+///
+/// 3. **Sorting**: Sort `P` and `Q`'s intercept values, maintaining
+///    an index to their associated vertex coordinates
+///
+/// 4. **Pruned Search**: Iterate through all `PQ` vertex pairs in sorted order, using early
+///    termination to skip full distance calculation for pairs whose intercept difference exceeds
+///    the current minimum distance, updating it when a new minimum is found.
+///
+/// # Projection Mathematics
+///
+/// The algorithm uses "lines" perpendicular to the connector between bbox centroids.
+/// If the centroid-to-centroid vector is `(dx, dy)`, the perpendicular slope is:
+/// - If `|dx| < |dy|` (connector more vertical): `slope = -dx/dy` (perpendicular is horizontal)
+/// - If `|dx| ≥ |dy|` (connector more horizontal): `slope = -dy/dx` (perpendicular is vertical)
+///
+/// Each "line" is drawn by plotting a line (with the perpendicular slope) through a vertex
+/// and its axis intercept (either `x` or `y`, see above).
+///
+/// # Early Termination
+///
+/// The algorithm maintains a `max_projection_delta` threshold calculated as:
+/// `min_distance * sqrt(1 + slope²)`
+///
+/// This factor enables pruning by relating `PQ` vertex pair intercept differences to minimum
+/// possible distances.
+///
+/// ## Why the Factor Works
+///
+/// Each vertex lies on a line with slope `k` (perpendicular to the connector). These parallel
+/// lines are distinguished by their axis intercepts: this is what we calculate and sort by.
+///
+/// If two `PQ` pair vertices have intercept difference Δi, their minimum possible Euclidean distance
+/// occurs when the minimum distance between the vertices is perpendicular to these parallel lines:
+/// - Moving 1 unit perpendicular to the lines changes actual distance by 1 unit
+/// - But changes the intercept by `sqrt(1 + slope²)` units
+///
+/// Therefore: `perpendicular_distance = intercept_difference / sqrt(1 + slope²)`
+///
+/// ## Pruning
+///
+/// Given current minimum distance `d_min`:
+/// - Any closer pair must have perpendicular separation `< d_min`
+/// - Therefore their intercept difference must be `< d_min * sqrt(1 + slope²)`
+///
+/// If two `PQ` pair vertices have intercept difference `> max_projection_delta`, they CANNOT be closer
+/// than `d_min` regardless of where they lie along their respective parallel lines. This is
+/// conservative but guarantees we never skip a potentially optimal pair.
+///
+/// # Performance
+///
+/// - Time complexity: `O(n log n)`
+///
+/// # Reference
+///
+/// Based on PostGIS [lw_dist2d_fast_ptarray_ptarray](https://github.com/postgis/postgis/blob/bd63102e05c5df317cb631efe782cc79e3e053db/liblwgeom/measures.c#L2035)
+fn distance_polygon_polygon_fast<F: GeoFloat>(poly_p: &Polygon<F>, poly_q: &Polygon<F>) -> F {
+    // Calculate bounding box centroids
+    let bbox_p = poly_p.bounding_rect().unwrap();
+    let bbox_q = poly_q.bounding_rect().unwrap();
+    let centroid_p = bbox_p.centroid();
+    let centroid_q = bbox_q.centroid();
+
+    let delta_x = centroid_q.x() - centroid_p.x();
+    let delta_y = centroid_q.y() - centroid_p.y();
+
+    // this is the slope (the `m` in `y = mx + b`) of lines that are perpendicular
+    // to the polygon bbox centroid connector. It's referred to as `k` in the PostGIS code.
+    let (slope, use_x_projection) = if delta_x.abs() < delta_y.abs() {
+        // Midpoint connection is more vertical → use horizontal-favouring projection
+        (-delta_x / delta_y, false)
+    } else {
+        // Midpoint connection is more horizontal → use vertical-favouring projection
+        (-delta_y / delta_x, true)
     };
 
-    // Pre-calculate axis length squared (avoid sqrt)
-    let axis_length_squared = axis_vector.magnitude_squared();
+    // Convenient access to the Polygon coordinate slices
+    let poly_p_coords = &poly_p.exterior().0;
+    let poly_q_coords = &poly_q.exterior().0;
 
-    // Project exterior ring vertices
-    poly.exterior()
-        .coords_iter()
-        .enumerate()
-        .map(|(idx, vertex_coord)| {
-            // Vector from axis start to vertex
-            let vertex_vector = Coord {
-                x: vertex_coord.x - c1.x,
-                y: vertex_coord.y - c1.y,
+    // Step 1: Project all vertices into 1D space
+    // This gives us intercepts + index of original vertex
+    let mut projected_vertices_p =
+        calculate_vertex_intercepts(poly_p_coords, slope, use_x_projection);
+    let mut projected_vertices_q =
+        calculate_vertex_intercepts(poly_q_coords, slope, use_x_projection);
+
+    // Step 2: Sort vertices by intercepts for spatial locality
+    projected_vertices_p.sort_unstable_by(|a, b| a.intercept.partial_cmp(&b.intercept).unwrap());
+    projected_vertices_q.sort_unstable_by(|a, b| a.intercept.partial_cmp(&b.intercept).unwrap());
+
+    // Step 3: Determine which polygon is "left" (lower centroid intercept value) vs "right"
+    // (higher centroid intercept value). This is critical for the iteration filter step to work efficiently
+    let centroid_p_projection = if use_x_projection {
+        centroid_p.x() - slope * centroid_p.y()
+    } else {
+        centroid_p.y() - slope * centroid_p.x()
+    };
+    let centroid_q_projection = if use_x_projection {
+        centroid_q.x() - slope * centroid_q.y()
+    } else {
+        centroid_q.y() - slope * centroid_q.x()
+    };
+    // the polygon whose midpoint has the lower projection value becomes
+    // the "left" polygon.
+    let (left_list, right_list, left_coords, right_coords) =
+        if centroid_p_projection < centroid_q_projection {
+            (
+                &projected_vertices_p,
+                &projected_vertices_q,
+                poly_p_coords,
+                poly_q_coords,
+            )
+        } else {
+            (
+                &projected_vertices_q,
+                &projected_vertices_p,
+                poly_q_coords,
+                poly_p_coords,
+            )
+        };
+
+    // Step 4a: use the distance between the first vertices in `P` and `Q` as the initial lower bound
+    let min_distance = Euclidean.distance(
+        poly_p_coords[projected_vertices_p[0].vertex_idx],
+        poly_q_coords[projected_vertices_q[0].vertex_idx],
+    );
+
+    // Step 4b: calculate the maximum projection difference that could yield a smaller distance
+    // This threshold allows us to skip vertex pairs that are too far apart by breaking early
+    let max_projection_delta = (min_distance * min_distance * (F::one() + slope * slope)).sqrt();
+
+    // Step 5: minimum distance calculation. This is a bit hairy as an iterator, but the logic is straightforward:
+    //
+    // First: polygon vertex order: the vertices are ordered by their intercepts, NOT in original order!
+    // We iterate through left polygon vertices in reverse (high→low intercept values)
+    // and for each one, iterate forward through right polygon vertices (low→high).
+    // 1. We start from the vertices that are closest together in 1D space
+    // (high values from left meeting low values from right)
+    // 2. As we iterate, the gap between projection values grows
+    // 3. We break whenever the gap exceeds our threshold
+    // 4. If we find a new minimum distance, store it and update the threshold.
+    let result = left_list.iter().rev().try_fold(
+        (min_distance, max_projection_delta),
+        |(min_dist, max_delta), vertex1| {
+            // Outer loop early termination: skip if remaining vertices are too far away
+            if right_list[0].intercept - vertex1.intercept > max_delta {
+                return ControlFlow::Break((min_dist, max_delta));
+            }
+
+            // Inner loop with early termination
+            let inner_result = right_list.iter().try_fold(
+                (min_dist, max_delta),
+                |(mut min_d, mut max_d), vertex2| {
+                    // Inner loop early termination: skip vertices beyond threshold
+                    if vertex2.intercept - vertex1.intercept >= max_d {
+                        return ControlFlow::Break((min_d, max_d));
+                    }
+
+                    // Calculate minimum distance between segments adjacent to these vertices
+                    let dist = get_min_segment_distance(
+                        left_coords,
+                        vertex1.vertex_idx,
+                        right_coords,
+                        vertex2.vertex_idx,
+                    );
+
+                    if dist < min_d {
+                        min_d = dist;
+                        // Update threshold when we find a closer distance
+                        max_d = (min_d * min_d * (F::one() + slope * slope)).sqrt();
+                    }
+                    ControlFlow::Continue((min_d, max_d))
+                },
+            );
+
+            let (new_min, new_delta) = match inner_result {
+                ControlFlow::Continue(values) | ControlFlow::Break(values) => values,
             };
 
-            let dot = vertex_vector.dot_product(axis_vector);
+            ControlFlow::Continue((new_min, new_delta))
+        },
+    );
 
-            // Normalize by axis length squared to get projection distance
-            let projection_distance = dot / axis_length_squared;
+    match result {
+        ControlFlow::Continue((min, _)) | ControlFlow::Break((min, _)) => min,
+    }
+}
 
-            (projection_distance, idx)
+/// Projects polygon vertices into 1D space (their intercept, given a slope and axis)
+/// The slope is the perpendicular to the `PQ` polygon bbox centroid connecting line. Either `x` or
+/// `y` axis would work, but one is chosen to avoid division by zero errors / small values causing fp
+/// issues.
+/// The PostGIS code refers to the intercept value as "themeasure".
+fn calculate_vertex_intercepts<F: GeoFloat>(
+    coords: &[Coord<F>],
+    perpendicular_slope: F,
+    use_x_intercept: bool,
+) -> Vec<ProjectedVertex<F>> {
+    coords
+        .iter()
+        .enumerate()
+        .map(|(idx, &coord)| {
+            // Calculate where a line through this vertex (with the perpendicular slope)
+            // intercepts either the x-axis or y-axis.
+            // This is the rearranged line equation: given y = mx + b, we solve for b.
+            let intercept = if use_x_intercept {
+                // For nearly vertical perpendiculars, find x-intercept
+                // From x = my + b, we get b = x - my
+                coord.x - perpendicular_slope * coord.y
+            } else {
+                // For nearly horizontal perpendiculars, find y-intercept
+                // From y = mx + b, we get b = y - mx
+                coord.y - perpendicular_slope * coord.x
+            };
+            ProjectedVertex {
+                intercept,
+                vertex_idx: idx,
+            }
         })
         .collect()
 }
 
-/// Calculates minimum distance between two horizontally-separated polygons using
-/// PostGIS-style "project and sort" algorithm.
+/// Calculates the minimum distance between segments adjacent to two vertices.
 ///
-/// This approach:
-/// 1. Calculates centroids of both polygons
-/// 2. Projects all vertices onto the line between centroids
-/// 3. Sorts projections to find candidate closest vertices
-/// 4. Uses segment context to calculate accurate distance
+/// For each vertex in a polygon, there are two adjacent segments (edges) connecting
+/// it to its neighbouring vertices. This function finds all four possible segment
+/// combinations between two vertices and returns their minimum distance.
 ///
-/// This handles complex non-convex polygons correctly, unlike simple x-extremes approach.
-fn project_and_sort_distance<F: GeoFloat>(poly1: &Polygon<F>, poly2: &Polygon<F>) -> F {
-    // Step 1: Get centroids
-    let c1 = poly1
-        .centroid()
-        .expect("Non-empty polygon should have centroid");
-    let c2 = poly2
-        .centroid()
-        .expect("Non-empty polygon should have centroid");
-
-    // Step 2: Project all vertices onto the centroid-to-centroid axis
-    let mut proj1 = project_vertices_onto_axis(poly1, c1, c2);
-    let mut proj2 = project_vertices_onto_axis(poly2, c1, c2);
-
-    // Step 3: Sort by projection distance
-    proj1.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-    proj2.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-
-    // Step 4: Determine which polygon is "left" vs "right" along the projection axis
-    // and get candidate vertices (rightmost of left, leftmost of right)
-    let (left_poly, right_poly, left_candidate_idx, right_candidate_idx) =
-        if proj1.last().unwrap().0 < proj2.first().unwrap().0 {
-            // poly1 is left, poly2 is right
-            (
-                poly1,
-                poly2,
-                proj1
-                    .last()
-                    .expect("The 'left' Polygon projection should not be empty, but it is")
-                    .1,
-                proj2
-                    .first()
-                    .expect("The 'right' Polygon projection should not be empty, but it is")
-                    .1,
-            )
-        } else {
-            // poly2 is left, poly1 is right
-            (
-                poly2,
-                poly1,
-                proj2.last().unwrap().1,
-                proj1.first().unwrap().1,
-            )
-        };
-
-    // Step 5: Use segment context to ensure correct distance calculation
-    let left_linestring = create_context_linestring(left_poly, left_candidate_idx);
-    let right_linestring = create_context_linestring(right_poly, right_candidate_idx);
-
-    // Step 6: Calculate final distance between the context LineStrings
-    Euclidean.distance(&left_linestring, &right_linestring)
-}
-
-/// Calculates the minimum separable distance between two non-overlapping polygons.
+/// # Parameters
 ///
-/// This function uses a PostGIS-inspired "project and sort" algorithm:
-/// 1. Projects both polygons onto the line between their centroids
-/// 2. Sorts the projected points to find candidates
-/// 3. Uses segment context around candidates for accurate distance calculation
+/// - `coords1`: Coordinates from the first polygon
+/// - `vertex_idx1`: Index of the vertex in the first polygon
+/// - `coords2`: Coordinates from the second polygon
+/// - `vertex_idx2`: Index of the vertex in the second polygon
 ///
-/// This approach correctly handles complex non-convex polygons where simple
-/// x-extremes approaches fail.
+/// # Algorithm
 ///
-/// # Arguments
-/// * `poly1` - First polygon (assumed non-overlapping with poly2)
-/// * `poly2` - Second polygon (assumed non-overlapping with poly1)
+/// For each vertex, we identify:
+/// 1. The segment from the previous vertex to this vertex
+/// 2. The segment from this vertex to the next vertex
 ///
-/// # Returns
-/// The minimum separable distance between the two polygons
-pub(crate) fn minimum_separable_distance<F: GeoFloat>(poly1: &Polygon<F>, poly2: &Polygon<F>) -> F {
-    project_and_sort_distance(poly1, poly2)
-}
+/// Then we compute distances between all 4 combinations.
+///
+/// # Edge Cases
+///
+/// The function correctly handles polygon closure where the last coordinate
+/// duplicates the first. When at vertex 0, the "previous" vertex wraps to n-1,
+/// and when at the last vertex, the "next" vertex wraps to 0.
+fn get_min_segment_distance<F: GeoFloat>(
+    coords1: &[Coord<F>],
+    vertex_idx1: usize,
+    coords2: &[Coord<F>],
+    vertex_idx2: usize,
+) -> F {
+    let n1 = coords1.len() - 1; // Last coord is duplicate of first (polygon closure)
+    let n2 = coords2.len() - 1;
 
-/// Creates a 3-vertex LineString from a Polygon index, with the given index as the middle vertex
-fn create_context_linestring<F: GeoFloat>(poly: &Polygon<F>, center_idx: usize) -> LineString<F> {
-    // Only consider the exterior ring since interior rings cannot be closest to external polygons
-    let exterior_coords = &poly.exterior().0;
-    let num_coords = exterior_coords.len();
-
-    if num_coords < 3 || center_idx >= num_coords {
-        // Fallback: return a degenerate LineString with just the first point if available
-        if let Some(&coord) = exterior_coords.first() {
-            return LineString::new(vec![coord]);
-        } else {
-            return LineString::new(vec![]);
-        }
-    }
-
-    // For closed polygons, the last coordinate duplicates the first
-    // We have n-1 unique vertices (indices 0 to n-2) plus closing duplicate at n-1
-    let effective_coords =
-        if num_coords > 1 && exterior_coords[0] == exterior_coords[num_coords - 1] {
-            num_coords - 1 // Exclude the duplicate closing vertex
-        } else {
-            num_coords
-        };
-
-    // Calculate previous and next indices with wraparound for closed polygon
-    let prev_idx = if center_idx == 0 {
-        effective_coords.saturating_sub(1)
+    // Get adjacent segment indices for vertex1
+    let prev_idx1 = if vertex_idx1 == 0 {
+        n1 - 1
     } else {
-        center_idx - 1
+        vertex_idx1 - 1
     };
-    let next_idx = if center_idx >= effective_coords - 1 {
-        0 // Wrap to start for closed polygon
+    let next_idx1 = if vertex_idx1 >= n1 - 1 {
+        0
     } else {
-        center_idx + 1
+        vertex_idx1 + 1
     };
 
-    // Create a 3-vertex LineString using direct indexing
-    LineString::new(vec![
-        exterior_coords[prev_idx],
-        exterior_coords[center_idx],
-        exterior_coords[next_idx],
-    ])
+    // Get adjacent segment indices for vertex2
+    let prev_idx2 = if vertex_idx2 == 0 {
+        n2 - 1
+    } else {
+        vertex_idx2 - 1
+    };
+    let next_idx2 = if vertex_idx2 >= n2 - 1 {
+        0
+    } else {
+        vertex_idx2 + 1
+    };
+
+    // Create the four segments adjacent to our two vertices
+    let seg1_prev = Line::new(coords1[prev_idx1], coords1[vertex_idx1]);
+    let seg1_next = Line::new(coords1[vertex_idx1], coords1[next_idx1]);
+    let seg2_prev = Line::new(coords2[prev_idx2], coords2[vertex_idx2]);
+    let seg2_next = Line::new(coords2[vertex_idx2], coords2[next_idx2]);
+
+    // Find minimum distance between all segment combinations
+    // TODO: can we do this in a more concise way?
+    Euclidean
+        .distance(&seg1_prev, &seg2_prev)
+        .min(Euclidean.distance(&seg1_prev, &seg2_next))
+        .min(Euclidean.distance(&seg1_next, &seg2_prev))
+        .min(Euclidean.distance(&seg1_next, &seg2_next))
 }
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -667,10 +771,6 @@ mod test {
         let b: Polygon =
             wkt! { POLYGON ((450 500, 485 449, 500 400, 500 200, 900 500, 640 520, 450 500)) }
                 .convert();
-        // FAILS!
-        // assertion `left == right` failed
-        // left: 100.0
-        // right: 260.72552617647546
         assert_eq!(100.0, Euclidean.distance(&a, &b));
     }
 
